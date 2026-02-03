@@ -161,7 +161,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Créer le serveur HTTP avec SSE
 const httpServer = createServer(async (req, res) => {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -183,11 +182,6 @@ const httpServer = createServer(async (req, res) => {
     res.writeHead(404);
     res.end("Not found");
   }
-});
-
-const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => {
-  console.log(`MCP Mem.ai server running on port ${PORT}`);
 });
 
 const PORT = process.env.PORT || 3000;
