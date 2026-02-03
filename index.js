@@ -6,19 +6,18 @@ import express from "express";
 import { randomUUID } from "crypto";
 
 const MEM_API_KEY = process.env.MEM_API_KEY;
-const MEM_API_BASE = "https://api.mem.ai/v1";
 
 // Store transports by sessionId for SSE connections
 const sseTransports = {};
 // Store transports by sessionId for Streamable HTTP connections  
 const httpTransports = {};
 
-// Function to call Mem.ai API
-async function callMemAPI(endpoint, method = "GET", body = null) {
+// Function to call Mem.ai API v0 (for creating mems)
+async function callMemAPIv0(endpoint, method = "GET", body = null) {
   const options = {
     method,
     headers: {
-      "Authorization": `ApiKey ${MEM_API_KEY}`,
+      "Authorization": `ApiAccessToken ${MEM_API_KEY}`,
       "Content-Type": "application/json",
     },
   };
@@ -27,10 +26,35 @@ async function callMemAPI(endpoint, method = "GET", body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(`${MEM_API_BASE}${endpoint}`, options);
+  const response = await fetch(`https://api.mem.ai/v0${endpoint}`, options);
   
   if (!response.ok) {
-    throw new Error(`Mem.ai API error: ${response.status} ${response.statusText}`);
+    const errorText = await response.text();
+    throw new Error(`Mem.ai API v0 error: ${response.status} ${response.statusText} - ${errorText}`);
+  }
+
+  return await response.json();
+}
+
+// Function to call Mem.ai API v2 (for mem-it endpoint)
+async function callMemAPIv2(endpoint, method = "POST", body = null) {
+  const options = {
+    method,
+    headers: {
+      "Authorization": `Bearer ${MEM_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+  };
+
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(`https://api.mem.ai/v2${endpoint}`, options);
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Mem.ai API v2 error: ${response.status} ${response.statusText} - ${errorText}`);
   }
 
   return await response.json();
@@ -44,28 +68,8 @@ function createServer() {
   });
 
   // Register tools
-  server.tool(
-    "mem_search",
-    "Search for notes in Mem.ai based on a query",
-    {
-      query: z.string().describe("Search query to find relevant notes"),
-      limit: z.number().optional().default(10).describe("Maximum number of results to return"),
-    },
-    async ({ query, limit }) => {
-      try {
-        const result = await callMemAPI(`/mems/search?q=${encodeURIComponent(query)}&limit=${limit || 10}`);
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: `Error: ${error.message}` }],
-          isError: true,
-        };
-      }
-    }
-  );
-
+  
+  // mem_create - Create a new mem using v0 API
   server.tool(
     "mem_create",
     "Create a new note in Mem.ai",
@@ -74,9 +78,35 @@ function createServer() {
     },
     async ({ content }) => {
       try {
-        const result = await callMemAPI("/mems", "POST", { content });
+        const result = await callMemAPIv0("/mems", "POST", { content });
         return {
-          content: [{ type: "text", text: `Note created successfully with ID: ${result.id}\n\n${JSON.stringify(result, null, 2)}` }],
+          content: [{ type: "text", text: `Note created successfully!\n\nID: ${result.id}\nCreated at: ${result.createdAt}\n\nContent: ${result.content}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error creating note: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // mem_it - Send content to Mem using v2 mem-it endpoint (intelligent processing)
+  server.tool(
+    "mem_search",
+    "Send content to Mem.ai for intelligent processing and organization. Mem will automatically process, organize, and structure your input.",
+    {
+      query: z.string().describe("The content or query to send to Mem for processing"),
+      limit: z.number().optional().default(10).describe("Not used - kept for compatibility"),
+    },
+    async ({ query }) => {
+      try {
+        const result = await callMemAPIv2("/mem-it", "POST", { 
+          input: query,
+          instructions: "Process this content and find relevant information"
+        });
+        return {
+          content: [{ type: "text", text: `Content sent to Mem for processing!\n\nRequest ID: ${result.requestId || result.id || 'Processing'}\n\nNote: Mem processes content in the background. Your content will be intelligently organized and searchable in Mem.` }],
         };
       } catch (error) {
         return {
@@ -87,6 +117,7 @@ function createServer() {
     }
   );
 
+  // mem_read - Read a specific mem by ID using v0 API
   server.tool(
     "mem_read",
     "Read a specific note by ID from Mem.ai",
@@ -95,13 +126,36 @@ function createServer() {
     },
     async ({ note_id }) => {
       try {
-        const result = await callMemAPI(`/mems/${note_id}`);
+        const result = await callMemAPIv0(`/mems/${note_id}`);
         return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text", text: `Note found!\n\nID: ${result.id}\nCreated at: ${result.createdAt}\n\nContent:\n${result.content}` }],
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Error: ${error.message}` }],
+          content: [{ type: "text", text: `Error reading note: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // mem_append - Append content to an existing mem
+  server.tool(
+    "mem_append",
+    "Append content to an existing note in Mem.ai",
+    {
+      note_id: z.string().describe("The ID of the note to append to"),
+      content: z.string().describe("The content to append"),
+    },
+    async ({ note_id, content }) => {
+      try {
+        const result = await callMemAPIv0(`/mems/${note_id}/append`, "POST", { content });
+        return {
+          content: [{ type: "text", text: `Content appended successfully!\n\nNote ID: ${note_id}\n\nAppended content:\n${content}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error appending to note: ${error.message}` }],
           isError: true,
         };
       }
@@ -280,21 +334,31 @@ app.get("/health", (req, res) => {
     sseActiveSessions: Object.keys(sseTransports).length,
     httpActiveSessions: Object.keys(httpTransports).length,
     memApiConfigured: !!MEM_API_KEY,
-    version: "1.0.0",
-    transports: ["streamable-http", "sse"]
+    version: "1.0.1",
+    transports: ["streamable-http", "sse"],
+    apiVersions: {
+      v0: "Used for create, read, append operations",
+      v2: "Used for mem-it intelligent processing"
+    }
   });
 });
 
 app.get("/", (req, res) => {
   res.json({
     name: "mem-mcp-server",
-    version: "1.0.0",
+    version: "1.0.1",
     description: "MCP server for Mem.ai",
     endpoints: {
       mcp: "/mcp (Streamable HTTP - recommended)",
       sse: "/sse (Legacy SSE)",
       messages: "/messages (Legacy SSE messages)",
       health: "/health"
+    },
+    tools: {
+      mem_create: "Create a new note (v0 API)",
+      mem_search: "Send content to Mem for intelligent processing (v2 mem-it API)",
+      mem_read: "Read a specific note by ID (v0 API)",
+      mem_append: "Append content to an existing note (v0 API)"
     },
     authentication: "none"
   });
