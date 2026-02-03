@@ -7,7 +7,10 @@ import { createServer } from "http";
 const MEM_API_KEY = process.env.MEM_API_KEY;
 const MEM_API_BASE = "https://api.mem.ai/v1";
 
-// Créer le serveur MCP
+// Store transports by sessionId for multiple connections
+const transports = {};
+
+// Create MCP server
 const server = new Server(
   {
     name: "mem-mcp-server",
@@ -20,7 +23,7 @@ const server = new Server(
   }
 );
 
-// Fonction pour appeler l'API Mem.ai
+// Function to call Mem.ai API
 async function callMemAPI(endpoint, method = "GET", body = null) {
   const options = {
     method,
@@ -43,7 +46,7 @@ async function callMemAPI(endpoint, method = "GET", body = null) {
   return await response.json();
 }
 
-// Lister les outils disponibles
+// List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -98,7 +101,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Gérer les appels d'outils
+// Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -159,32 +162,132 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Créer le serveur HTTP avec SSE
+// Helper to parse request body
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+// Helper to parse URL and query params
+function parseUrl(req) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  return {
+    pathname: url.pathname,
+    searchParams: url.searchParams
+  };
+}
+
+// Create HTTP server with SSE
 const httpServer = createServer(async (req, res) => {
+  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+  res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
   
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
     res.end();
     return;
   }
+
+  const { pathname, searchParams } = parseUrl(req);
   
-  if (req.url === "/sse" && req.method === "GET") {
+  // SSE endpoint - establishes the connection
+  if (pathname === "/sse" && req.method === "GET") {
     console.log("SSE connection received");
-    const transport = new SSEServerTransport("/sse", res);
-    await server.connect(transport);
-  } else if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("OK");
-  } else {
-    res.writeHead(404);
-    res.end("Not found");
+    
+    try {
+      // Create transport - the path '/messages' tells clients where to POST
+      const transport = new SSEServerTransport("/messages", res);
+      
+      // Store transport by sessionId for later retrieval
+      transports[transport.sessionId] = transport;
+      console.log(`Created session: ${transport.sessionId}`);
+      
+      // Clean up on connection close
+      res.on("close", () => {
+        console.log(`Session closed: ${transport.sessionId}`);
+        delete transports[transport.sessionId];
+      });
+      
+      // Connect the MCP server to this transport
+      await server.connect(transport);
+    } catch (error) {
+      console.error("SSE connection error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      }
+    }
+    return;
   }
+  
+  // Messages endpoint - handles client-to-server communication
+  if (pathname === "/messages" && req.method === "POST") {
+    // Get sessionId from query params (set by SSEServerTransport)
+    const sessionId = searchParams.get('sessionId');
+    console.log(`Message received for session: ${sessionId}`);
+    
+    if (!sessionId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing sessionId parameter" }));
+      return;
+    }
+    
+    const transport = transports[sessionId];
+    
+    if (!transport) {
+      console.error(`No transport found for session: ${sessionId}`);
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Session not found" }));
+      return;
+    }
+    
+    try {
+      // Let the transport handle the POST message
+      await transport.handlePostMessage(req, res);
+    } catch (error) {
+      console.error("Error handling message:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+    }
+    return;
+  }
+  
+  // Health check endpoint
+  if (pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ 
+      status: "ok",
+      activeSessions: Object.keys(transports).length 
+    }));
+    return;
+  }
+  
+  // 404 for unknown routes
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
 });
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
   console.log(`MCP Mem.ai server running on port ${PORT}`);
+  console.log(`SSE endpoint: /sse`);
+  console.log(`Messages endpoint: /messages`);
+  console.log(`Health check: /health`);
 });
