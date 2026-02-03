@@ -1,26 +1,17 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
 import express from "express";
+import { randomUUID } from "crypto";
 
 const MEM_API_KEY = process.env.MEM_API_KEY;
 const MEM_API_BASE = "https://api.mem.ai/v1";
 
-// Store transports by sessionId for multiple simultaneous connections
-const transports = {};
-
-// Create MCP server
-const server = new Server(
-  {
-    name: "mem-mcp-server",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+// Store transports by sessionId for SSE connections
+const sseTransports = {};
+// Store transports by sessionId for Streamable HTTP connections  
+const httpTransports = {};
 
 // Function to call Mem.ai API
 async function callMemAPI(endpoint, method = "GET", body = null) {
@@ -45,131 +36,94 @@ async function callMemAPI(endpoint, method = "GET", body = null) {
   return await response.json();
 }
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "mem_search",
-        description: "Search for notes in Mem.ai based on a query",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Search query to find relevant notes",
-            },
-            limit: {
-              type: "number",
-              description: "Maximum number of results to return (default: 10)",
-              default: 10,
-            },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "mem_create",
-        description: "Create a new note in Mem.ai",
-        inputSchema: {
-          type: "object",
-          properties: {
-            content: {
-              type: "string",
-              description: "The content of the note to create",
-            },
-          },
-          required: ["content"],
-        },
-      },
-      {
-        name: "mem_read",
-        description: "Read a specific note by ID from Mem.ai",
-        inputSchema: {
-          type: "object",
-          properties: {
-            note_id: {
-              type: "string",
-              description: "The ID of the note to read",
-            },
-          },
-          required: ["note_id"],
-        },
-      },
-    ],
-  };
-});
+// Create a new MCP server instance
+function createServer() {
+  const server = new McpServer({
+    name: "mem-mcp-server",
+    version: "1.0.0",
+  });
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  try {
-    switch (name) {
-      case "mem_search": {
-        const limit = args.limit || 10;
-        const result = await callMemAPI(`/mems/search?q=${encodeURIComponent(args.query)}&limit=${limit}`);
+  // Register tools
+  server.tool(
+    "mem_search",
+    "Search for notes in Mem.ai based on a query",
+    {
+      query: z.string().describe("Search query to find relevant notes"),
+      limit: z.number().optional().default(10).describe("Maximum number of results to return"),
+    },
+    async ({ query, limit }) => {
+      try {
+        const result = await callMemAPI(`/mems/search?q=${encodeURIComponent(query)}&limit=${limit || 10}`);
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
         };
       }
-
-      case "mem_create": {
-        const result = await callMemAPI("/mems", "POST", {
-          content: args.content,
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Note created successfully with ID: ${result.id}\n\n${JSON.stringify(result, null, 2)}`,
-            },
-          ],
-        };
-      }
-
-      case "mem_read": {
-        const result = await callMemAPI(`/mems/${args.note_id}`);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
-      }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (error) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${error.message}`,
-        },
-      ],
-      isError: true,
-    };
-  }
-});
+  );
+
+  server.tool(
+    "mem_create",
+    "Create a new note in Mem.ai",
+    {
+      content: z.string().describe("The content of the note to create"),
+    },
+    async ({ content }) => {
+      try {
+        const result = await callMemAPI("/mems", "POST", { content });
+        return {
+          content: [{ type: "text", text: `Note created successfully with ID: ${result.id}\n\n${JSON.stringify(result, null, 2)}` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "mem_read",
+    "Read a specific note by ID from Mem.ai",
+    {
+      note_id: z.string().describe("The ID of the note to read"),
+    },
+    async ({ note_id }) => {
+      try {
+        const result = await callMemAPI(`/mems/${note_id}`);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  return server;
+}
 
 // Create Express app
 const app = express();
 
+// Parse JSON bodies for POST requests
+app.use(express.json());
+
 // CORS middleware
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id, Accept, Cache-Control');
   res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+  res.setHeader('Access-Control-Max-Age', '86400');
   
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -177,25 +131,112 @@ app.use((req, res, next) => {
   next();
 });
 
-// SSE endpoint - establishes the connection
+// ============================================
+// Streamable HTTP Transport (Modern - /mcp)
+// ============================================
+
+app.all("/mcp", async (req, res) => {
+  console.log(`MCP ${req.method} request received`);
+  
+  // Get or create session ID
+  let sessionId = req.headers['mcp-session-id'];
+  
+  if (req.method === 'POST') {
+    // Check if this is an initialize request (new session)
+    const isInitialize = req.body?.method === 'initialize';
+    
+    if (isInitialize || !sessionId) {
+      // Create new session
+      sessionId = randomUUID();
+      console.log(`Creating new Streamable HTTP session: ${sessionId}`);
+      
+      const server = createServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId,
+      });
+      
+      httpTransports[sessionId] = { server, transport };
+      
+      // Connect server to transport
+      await server.connect(transport);
+      
+      // Clean up on close
+      res.on('close', () => {
+        if (httpTransports[sessionId]) {
+          console.log(`Cleaning up HTTP session: ${sessionId}`);
+        }
+      });
+    }
+    
+    const session = httpTransports[sessionId];
+    if (!session) {
+      console.error(`No session found for: ${sessionId}`);
+      return res.status(404).json({ error: "Session not found" });
+    }
+    
+    // Set session ID header
+    res.setHeader('Mcp-Session-Id', sessionId);
+    
+    try {
+      await session.transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    }
+  } else if (req.method === 'GET') {
+    // GET request for SSE stream (optional in Streamable HTTP)
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing Mcp-Session-Id header" });
+    }
+    
+    const session = httpTransports[sessionId];
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+    
+    res.setHeader('Mcp-Session-Id', sessionId);
+    
+    try {
+      await session.transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("Error handling GET request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    }
+  } else if (req.method === 'DELETE') {
+    // Session termination
+    if (sessionId && httpTransports[sessionId]) {
+      delete httpTransports[sessionId];
+      console.log(`Deleted HTTP session: ${sessionId}`);
+    }
+    res.sendStatus(204);
+  } else {
+    res.status(405).json({ error: "Method not allowed" });
+  }
+});
+
+// ============================================
+// Legacy SSE Transport (/sse + /messages)
+// ============================================
+
 app.get("/sse", async (req, res) => {
   console.log("SSE connection received");
   
   try {
-    // Create transport - the path '/messages' tells clients where to POST
+    const server = createServer();
     const transport = new SSEServerTransport("/messages", res);
     
-    // Store transport by sessionId for later retrieval
-    transports[transport.sessionId] = transport;
-    console.log(`Created session: ${transport.sessionId}`);
+    sseTransports[transport.sessionId] = { server, transport };
+    console.log(`Created SSE session: ${transport.sessionId}`);
     
-    // Clean up on connection close
     res.on("close", () => {
-      console.log(`Session closed: ${transport.sessionId}`);
-      delete transports[transport.sessionId];
+      console.log(`SSE session closed: ${transport.sessionId}`);
+      delete sseTransports[transport.sessionId];
     });
     
-    // Connect the MCP server to this transport
     await server.connect(transport);
   } catch (error) {
     console.error("SSE connection error:", error);
@@ -205,61 +246,71 @@ app.get("/sse", async (req, res) => {
   }
 });
 
-// Messages endpoint - handles client-to-server communication
-// The SDK's handlePostMessage reads the raw body, so don't use express.json() globally
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
-  console.log(`Message received for session: ${sessionId}`);
+  console.log(`SSE message received for session: ${sessionId}`);
   
   if (!sessionId) {
     return res.status(400).json({ error: "Missing sessionId parameter" });
   }
   
-  const transport = transports[sessionId];
-  
-  if (!transport) {
-    console.error(`No transport found for session: ${sessionId}`);
+  const session = sseTransports[sessionId];
+  if (!session) {
+    console.error(`No SSE transport found for session: ${sessionId}`);
     return res.status(404).json({ error: "Session not found" });
   }
   
   try {
-    // Let the transport handle the POST message
-    await transport.handlePostMessage(req, res);
+    await session.transport.handlePostMessage(req, res);
   } catch (error) {
-    console.error("Error handling message:", error);
+    console.error("Error handling SSE message:", error);
     if (!res.headersSent) {
       res.status(500).json({ error: "Internal server error" });
     }
   }
 });
 
-// Health check endpoint
+// ============================================
+// Info & Health Endpoints
+// ============================================
+
 app.get("/health", (req, res) => {
   res.json({ 
     status: "ok",
-    activeSessions: Object.keys(transports).length,
-    memApiConfigured: !!MEM_API_KEY
+    sseActiveSessions: Object.keys(sseTransports).length,
+    httpActiveSessions: Object.keys(httpTransports).length,
+    memApiConfigured: !!MEM_API_KEY,
+    version: "1.0.0",
+    transports: ["streamable-http", "sse"]
   });
 });
 
-// Root endpoint
 app.get("/", (req, res) => {
   res.json({
     name: "mem-mcp-server",
     version: "1.0.0",
+    description: "MCP server for Mem.ai",
     endpoints: {
-      sse: "/sse",
-      messages: "/messages",
+      mcp: "/mcp (Streamable HTTP - recommended)",
+      sse: "/sse (Legacy SSE)",
+      messages: "/messages (Legacy SSE messages)",
       health: "/health"
-    }
+    },
+    authentication: "none"
   });
 });
 
+// Catch-all for unknown routes
+app.use((req, res) => {
+  console.log(`404 for: ${req.method} ${req.path}`);
+  res.status(404).json({ error: "Not found", path: req.path });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`MCP Mem.ai server running on port ${PORT}`);
-  console.log(`SSE endpoint: /sse`);
-  console.log(`Messages endpoint: /messages`);
+  console.log(`Streamable HTTP endpoint: /mcp (recommended)`);
+  console.log(`Legacy SSE endpoint: /sse`);
   console.log(`Health check: /health`);
   console.log(`MEM_API_KEY configured: ${!!MEM_API_KEY}`);
 });
