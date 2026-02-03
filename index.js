@@ -174,4 +174,6 @@ const httpServer = createServer(async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => {​​​​​​​​​​​​​​​​
+httpServer.listen(PORT, () => {
+  console.log(`MCP Mem.ai server running on port ${PORT}`);
+});
