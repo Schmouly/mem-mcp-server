@@ -12,32 +12,8 @@ const sseTransports = {};
 // Store transports by sessionId for Streamable HTTP connections  
 const httpTransports = {};
 
-// Function to call Mem.ai API v0 (for creating mems)
-async function callMemAPIv0(endpoint, method = "GET", body = null) {
-  const options = {
-    method,
-    headers: {
-      "Authorization": `ApiAccessToken ${MEM_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-  };
-
-  if (body) {
-    options.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(`https://api.mem.ai/v0${endpoint}`, options);
-  
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Mem.ai API v0 error: ${response.status} ${response.statusText} - ${errorText}`);
-  }
-
-  return await response.json();
-}
-
-// Function to call Mem.ai API v2 (for mem-it endpoint)
-async function callMemAPIv2(endpoint, method = "POST", body = null) {
+// Function to call Mem.ai API v2
+async function callMemAPIv2(endpoint, method = "GET", body = null) {
   const options = {
     method,
     headers: {
@@ -64,23 +40,154 @@ async function callMemAPIv2(endpoint, method = "POST", body = null) {
 function createServer() {
   const server = new McpServer({
     name: "mem-mcp-server",
-    version: "1.0.0",
+    version: "2.0.1",
   });
 
-  // Register tools
-  
-  // mem_create - Create a new mem using v0 API
+  // =====================
+  // NOTES TOOLS
+  // =====================
+
+  // mem_search - POST /v2/notes/search
+  // Doc: https://docs.mem.ai/api-reference/notes/search-notes
+  server.tool(
+    "mem_search",
+    "Search notes in Mem.ai using semantic search",
+    {
+      query: z.string().describe("The search query to find relevant notes"),
+      filter_by_contains_open_tasks: z.boolean().optional().default(false).describe("Filter for notes with open tasks"),
+    },
+    async ({ query, filter_by_contains_open_tasks }) => {
+      try {
+        const body = { 
+          query: query,
+          config: {
+            include_note_content: true
+          }
+        };
+        
+        if (filter_by_contains_open_tasks) {
+          body.filter_by_contains_open_tasks = true;
+        }
+        
+        const result = await callMemAPIv2("/notes/search", "POST", body);
+        
+        if (!result.results || result.results.length === 0) {
+          return {
+            content: [{ type: "text", text: `No notes found matching "${query}"` }],
+          };
+        }
+        
+        let responseText = `Found ${result.total} notes matching "${query}":\n\n`;
+        
+        for (const note of result.results) {
+          responseText += `---\n`;
+          responseText += `**${note.title || 'Untitled'}** (ID: ${note.id})\n`;
+          responseText += `Created: ${note.created_at} | Updated: ${note.updated_at}\n`;
+          if (note.snippet) {
+            responseText += `Snippet: ${note.snippet}\n`;
+          }
+          if (note.content) {
+            responseText += `Content:\n${note.content.substring(0, 500)}${note.content.length > 500 ? '...' : ''}\n`;
+          }
+          responseText += `\n`;
+        }
+        
+        return {
+          content: [{ type: "text", text: responseText }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error searching notes: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // mem_list - GET /v2/notes
+  // Doc: https://docs.mem.ai/api-reference/notes/list-notes
+  server.tool(
+    "mem_list",
+    "List notes from Mem.ai with optional filtering",
+    {
+      limit: z.number().optional().default(20).describe("Maximum number of notes to return (default: 20, max: 50)"),
+      order_by: z.enum(["created_at", "updated_at"]).optional().default("updated_at").describe("Sort order"),
+      contains_open_tasks: z.boolean().optional().default(false).describe("Filter for notes with open tasks"),
+      include_content: z.boolean().optional().default(true).describe("Include note content in response"),
+    },
+    async ({ limit, order_by, contains_open_tasks, include_content }) => {
+      try {
+        // Build query string - these are query params, not body
+        const params = new URLSearchParams();
+        params.append('limit', String(limit || 20));
+        params.append('order_by', order_by || 'updated_at');
+        params.append('include_note_content', String(include_content !== false));
+        if (contains_open_tasks) {
+          params.append('contains_open_tasks', 'true');
+        }
+        
+        const result = await callMemAPIv2(`/notes?${params.toString()}`, "GET");
+        
+        if (!result.results || result.results.length === 0) {
+          return {
+            content: [{ type: "text", text: "No notes found" }],
+          };
+        }
+        
+        let responseText = `Found ${result.total} notes:\n\n`;
+        
+        for (const note of result.results) {
+          responseText += `---\n`;
+          responseText += `**${note.title || 'Untitled'}** (ID: ${note.id})\n`;
+          responseText += `Created: ${note.created_at} | Updated: ${note.updated_at}\n`;
+          if (note.snippet) {
+            responseText += `Snippet: ${note.snippet}\n`;
+          }
+          if (note.content) {
+            responseText += `Content:\n${note.content.substring(0, 300)}${note.content.length > 300 ? '...' : ''}\n`;
+          }
+          responseText += `\n`;
+        }
+        
+        if (result.next_page) {
+          responseText += `\n(More notes available - use pagination to see more)`;
+        }
+        
+        return {
+          content: [{ type: "text", text: responseText }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error listing notes: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // mem_create - POST /v2/notes
+  // Doc: https://docs.mem.ai/api-reference/notes/create-note
   server.tool(
     "mem_create",
     "Create a new note in Mem.ai",
     {
-      content: z.string().describe("The content of the note to create"),
+      content: z.string().describe("The markdown content of the note (first line becomes title, max ~200k chars)"),
+      collection_titles: z.array(z.string()).optional().describe("Optional collection titles to add the note to"),
+      collection_ids: z.array(z.string()).optional().describe("Optional collection IDs to add the note to"),
     },
-    async ({ content }) => {
+    async ({ content, collection_titles, collection_ids }) => {
       try {
-        const result = await callMemAPIv0("/mems", "POST", { content });
+        const body = { content };
+        if (collection_titles && collection_titles.length > 0) {
+          body.collection_titles = collection_titles;
+        }
+        if (collection_ids && collection_ids.length > 0) {
+          body.collection_ids = collection_ids;
+        }
+        
+        const result = await callMemAPIv2("/notes", "POST", body);
         return {
-          content: [{ type: "text", text: `Note created successfully!\n\nID: ${result.id}\nCreated at: ${result.createdAt}\n\nContent: ${result.content}` }],
+          content: [{ type: "text", text: `Note created successfully!\n\nID: ${result.id}\nTitle: ${result.title}\nCreated at: ${result.created_at}\nCollections: ${result.collection_ids?.join(', ') || 'none'}` }],
         };
       } catch (error) {
         return {
@@ -91,44 +198,22 @@ function createServer() {
     }
   );
 
-  // mem_it - Send content to Mem using v2 mem-it endpoint (intelligent processing)
-  server.tool(
-    "mem_search",
-    "Send content to Mem.ai for intelligent processing and organization. Mem will automatically process, organize, and structure your input.",
-    {
-      query: z.string().describe("The content or query to send to Mem for processing"),
-      limit: z.number().optional().default(10).describe("Not used - kept for compatibility"),
-    },
-    async ({ query }) => {
-      try {
-        const result = await callMemAPIv2("/mem-it", "POST", { 
-          input: query,
-          instructions: "Process this content and find relevant information"
-        });
-        return {
-          content: [{ type: "text", text: `Content sent to Mem for processing!\n\nRequest ID: ${result.requestId || result.id || 'Processing'}\n\nNote: Mem processes content in the background. Your content will be intelligently organized and searchable in Mem.` }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: `Error: ${error.message}` }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // mem_read - Read a specific mem by ID using v0 API
+  // mem_read - GET /v2/notes/{note_id}
+  // Doc: https://docs.mem.ai/api-reference/notes/read-note
   server.tool(
     "mem_read",
     "Read a specific note by ID from Mem.ai",
     {
-      note_id: z.string().describe("The ID of the note to read"),
+      note_id: z.string().describe("The UUID of the note to read"),
     },
     async ({ note_id }) => {
       try {
-        const result = await callMemAPIv0(`/mems/${note_id}`);
+        const result = await callMemAPIv2(`/notes/${note_id}`, "GET");
         return {
-          content: [{ type: "text", text: `Note found!\n\nID: ${result.id}\nCreated at: ${result.createdAt}\n\nContent:\n${result.content}` }],
+          content: [{ 
+            type: "text", 
+            text: `**${result.title || 'Untitled'}**\n\nID: ${result.id}\nCreated: ${result.created_at}\nUpdated: ${result.updated_at}\nCollections: ${result.collection_ids?.join(', ') || 'none'}\n\n---\n\n${result.content}` 
+          }],
         };
       } catch (error) {
         return {
@@ -139,23 +224,136 @@ function createServer() {
     }
   );
 
-  // mem_append - Append content to an existing mem
+  // mem_delete - DELETE /v2/notes/{note_id}
+  // Doc: https://docs.mem.ai/api-reference/notes/delete-note
   server.tool(
-    "mem_append",
-    "Append content to an existing note in Mem.ai",
+    "mem_delete",
+    "Delete a note from Mem.ai",
     {
-      note_id: z.string().describe("The ID of the note to append to"),
-      content: z.string().describe("The content to append"),
+      note_id: z.string().describe("The UUID of the note to delete"),
     },
-    async ({ note_id, content }) => {
+    async ({ note_id }) => {
       try {
-        const result = await callMemAPIv0(`/mems/${note_id}/append`, "POST", { content });
+        const result = await callMemAPIv2(`/notes/${note_id}`, "DELETE");
         return {
-          content: [{ type: "text", text: `Content appended successfully!\n\nNote ID: ${note_id}\n\nAppended content:\n${content}` }],
+          content: [{ type: "text", text: `Note ${note_id} deleted successfully.\nRequest ID: ${result.request_id}` }],
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Error appending to note: ${error.message}` }],
+          content: [{ type: "text", text: `Error deleting note: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================
+  // MEM IT TOOL
+  // =====================
+
+  // mem_it - POST /v2/mem-it
+  // Doc: https://docs.mem.ai/api-reference/mem-it/mem-it
+  server.tool(
+    "mem_it",
+    "Send content to Mem.ai for intelligent processing and organization (async)",
+    {
+      input: z.string().describe("The content to send to Mem for processing"),
+      instructions: z.string().optional().describe("Optional instructions for how Mem should process the content"),
+      context: z.string().optional().describe("Optional context about the content"),
+    },
+    async ({ input, instructions, context }) => {
+      try {
+        const body = { input };
+        if (instructions) body.instructions = instructions;
+        if (context) body.context = context;
+        
+        const result = await callMemAPIv2("/mem-it", "POST", body);
+        return {
+          content: [{ type: "text", text: `Content sent to Mem for processing!\n\nRequest ID: ${result.request_id}\n\nNote: Mem processes content asynchronously in the background.` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================
+  // COLLECTIONS TOOLS
+  // =====================
+
+  // mem_collections_list - GET /v2/collections
+  server.tool(
+    "mem_collections_list",
+    "List collections from Mem.ai",
+    {
+      limit: z.number().optional().default(20).describe("Maximum number of collections to return"),
+    },
+    async ({ limit }) => {
+      try {
+        const result = await callMemAPIv2(`/collections?limit=${limit || 20}`, "GET");
+        
+        if (!result.results || result.results.length === 0) {
+          return {
+            content: [{ type: "text", text: "No collections found" }],
+          };
+        }
+        
+        let responseText = `Found ${result.total} collections:\n\n`;
+        
+        for (const collection of result.results) {
+          responseText += `- **${collection.title}** (ID: ${collection.id})\n`;
+          if (collection.description) {
+            responseText += `  Description: ${collection.description}\n`;
+          }
+        }
+        
+        return {
+          content: [{ type: "text", text: responseText }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error listing collections: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // mem_collections_search - POST /v2/collections/search
+  server.tool(
+    "mem_collections_search",
+    "Search collections in Mem.ai",
+    {
+      query: z.string().describe("The search query for collections"),
+    },
+    async ({ query }) => {
+      try {
+        const result = await callMemAPIv2("/collections/search", "POST", { query });
+        
+        if (!result.results || result.results.length === 0) {
+          return {
+            content: [{ type: "text", text: `No collections found matching "${query}"` }],
+          };
+        }
+        
+        let responseText = `Found ${result.total} collections matching "${query}":\n\n`;
+        
+        for (const collection of result.results) {
+          responseText += `- **${collection.title}** (ID: ${collection.id})\n`;
+          if (collection.description) {
+            responseText += `  Description: ${collection.description}\n`;
+          }
+        }
+        
+        return {
+          content: [{ type: "text", text: responseText }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Error searching collections: ${error.message}` }],
           isError: true,
         };
       }
@@ -192,15 +390,12 @@ app.use((req, res, next) => {
 app.all("/mcp", async (req, res) => {
   console.log(`MCP ${req.method} request received`);
   
-  // Get or create session ID
   let sessionId = req.headers['mcp-session-id'];
   
   if (req.method === 'POST') {
-    // Check if this is an initialize request (new session)
     const isInitialize = req.body?.method === 'initialize';
     
     if (isInitialize || !sessionId) {
-      // Create new session
       sessionId = randomUUID();
       console.log(`Creating new Streamable HTTP session: ${sessionId}`);
       
@@ -210,11 +405,8 @@ app.all("/mcp", async (req, res) => {
       });
       
       httpTransports[sessionId] = { server, transport };
-      
-      // Connect server to transport
       await server.connect(transport);
       
-      // Clean up on close
       res.on('close', () => {
         if (httpTransports[sessionId]) {
           console.log(`Cleaning up HTTP session: ${sessionId}`);
@@ -228,7 +420,6 @@ app.all("/mcp", async (req, res) => {
       return res.status(404).json({ error: "Session not found" });
     }
     
-    // Set session ID header
     res.setHeader('Mcp-Session-Id', sessionId);
     
     try {
@@ -240,7 +431,6 @@ app.all("/mcp", async (req, res) => {
       }
     }
   } else if (req.method === 'GET') {
-    // GET request for SSE stream (optional in Streamable HTTP)
     if (!sessionId) {
       return res.status(400).json({ error: "Missing Mcp-Session-Id header" });
     }
@@ -261,7 +451,6 @@ app.all("/mcp", async (req, res) => {
       }
     }
   } else if (req.method === 'DELETE') {
-    // Session termination
     if (sessionId && httpTransports[sessionId]) {
       delete httpTransports[sessionId];
       console.log(`Deleted HTTP session: ${sessionId}`);
@@ -334,11 +523,13 @@ app.get("/health", (req, res) => {
     sseActiveSessions: Object.keys(sseTransports).length,
     httpActiveSessions: Object.keys(httpTransports).length,
     memApiConfigured: !!MEM_API_KEY,
-    version: "1.0.1",
+    version: "2.0.1",
     transports: ["streamable-http", "sse"],
-    apiVersions: {
-      v0: "Used for create, read, append operations",
-      v2: "Used for mem-it intelligent processing"
+    apiVersion: "v2",
+    endpoints: {
+      notes: "POST /v2/notes/search, GET /v2/notes, POST /v2/notes, GET /v2/notes/{id}, DELETE /v2/notes/{id}",
+      memIt: "POST /v2/mem-it",
+      collections: "GET /v2/collections, POST /v2/collections/search"
     }
   });
 });
@@ -346,8 +537,9 @@ app.get("/health", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     name: "mem-mcp-server",
-    version: "1.0.1",
-    description: "MCP server for Mem.ai",
+    version: "2.0.1",
+    description: "MCP server for Mem.ai using v2 API",
+    documentation: "https://docs.mem.ai/api-reference/overview/introduction",
     endpoints: {
       mcp: "/mcp (Streamable HTTP - recommended)",
       sse: "/sse (Legacy SSE)",
@@ -355,16 +547,18 @@ app.get("/", (req, res) => {
       health: "/health"
     },
     tools: {
-      mem_create: "Create a new note (v0 API)",
-      mem_search: "Send content to Mem for intelligent processing (v2 mem-it API)",
-      mem_read: "Read a specific note by ID (v0 API)",
-      mem_append: "Append content to an existing note (v0 API)"
-    },
-    authentication: "none"
+      mem_search: "POST /v2/notes/search - Search notes",
+      mem_list: "GET /v2/notes - List notes with filters",
+      mem_create: "POST /v2/notes - Create a new note",
+      mem_read: "GET /v2/notes/{id} - Read a note by ID",
+      mem_delete: "DELETE /v2/notes/{id} - Delete a note",
+      mem_it: "POST /v2/mem-it - Intelligent content processing",
+      mem_collections_list: "GET /v2/collections - List collections",
+      mem_collections_search: "POST /v2/collections/search - Search collections"
+    }
   });
 });
 
-// Catch-all for unknown routes
 app.use((req, res) => {
   console.log(`404 for: ${req.method} ${req.path}`);
   res.status(404).json({ error: "Not found", path: req.path });
@@ -372,9 +566,8 @@ app.use((req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`MCP Mem.ai server running on port ${PORT}`);
-  console.log(`Streamable HTTP endpoint: /mcp (recommended)`);
-  console.log(`Legacy SSE endpoint: /sse`);
-  console.log(`Health check: /health`);
+  console.log(`MCP Mem.ai server v2.0.1 running on port ${PORT}`);
+  console.log(`Using Mem.ai API v2 - https://docs.mem.ai`);
+  console.log(`Streamable HTTP: /mcp | SSE: /sse | Health: /health`);
   console.log(`MEM_API_KEY configured: ${!!MEM_API_KEY}`);
 });
