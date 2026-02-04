@@ -224,29 +224,6 @@ function createServer() {
     }
   );
 
-  // mem_delete - DELETE /v2/notes/{note_id}
-  // Doc: https://docs.mem.ai/api-reference/notes/delete-note
-  server.tool(
-    "mem_delete",
-    "Delete a note from Mem.ai",
-    {
-      note_id: z.string().describe("The UUID of the note to delete"),
-    },
-    async ({ note_id }) => {
-      try {
-        const result = await callMemAPIv2(`/notes/${note_id}`, "DELETE");
-        return {
-          content: [{ type: "text", text: `Note ${note_id} deleted successfully.\nRequest ID: ${result.request_id}` }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: `Error deleting note: ${error.message}` }],
-          isError: true,
-        };
-      }
-    }
-  );
-
   // =====================
   // MEM IT TOOL
   // =====================
@@ -551,7 +528,6 @@ app.get("/", (req, res) => {
       mem_list: "GET /v2/notes - List notes with filters",
       mem_create: "POST /v2/notes - Create a new note",
       mem_read: "GET /v2/notes/{id} - Read a note by ID",
-      mem_delete: "DELETE /v2/notes/{id} - Delete a note",
       mem_it: "POST /v2/mem-it - Intelligent content processing",
       mem_collections_list: "GET /v2/collections - List collections",
       mem_collections_search: "POST /v2/collections/search - Search collections"
