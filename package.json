@@ -1,6 +1,6 @@
 {
   "name": "mem-mcp-server",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "MCP server for Mem.ai",
   "main": "index.js",
